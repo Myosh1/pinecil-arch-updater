@@ -1,0 +1,594 @@
+#!/bin/bash
+
+# ============================================================
+#  pineup — Pinecil Arch Updater
+#  Automated IronOS firmware flasher for Pinecil V1/V2
+#  Arch Linux based distributions only.
+#
+#  Authors:
+#    Myoshi             — concept, testing, debugging
+#    Claude (Anthropic) — script development
+#    ChatGPT (OpenAI)   — assistance at various stages
+#
+#  Firmware: IronOS by Ralim (GNU GPLv3)
+#    https://github.com/Ralim/IronOS
+#    This script downloads firmware directly from the official
+#    GitHub repository and does not re-host any files.
+#
+#  License: MIT
+#
+#  Usage:
+#      pineup                       # interactive mode
+#      pineup --v2 --lang EN        # non-interactive
+#      pineup --v2 --lang EN --auto # fully automated
+#      pineup --help
+#
+#  Environment variables:
+#    DEBUG=1          verbose tracing (set -x)
+#    LOG_FILE=/path   custom log file path
+# ============================================================
+
+set -euo pipefail
+[[ "${DEBUG:-0}" == "1" ]] && set -x
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+TMPDIR_FLASH=$(mktemp -d)
+LOG_FILE="${LOG_FILE:-/tmp/pinecil-flash-$(date +%Y%m%d_%H%M%S).log}"
+LOCK_FILE="/tmp/pinecil-flash.lock"
+
+# Pinecil V2 uses BL706 chip. In flashing mode it exposes VID:PID ffff:ffff
+# ("BLIOT CDC Virtual ComPort") — this is the REAL hardware ID, not a placeholder.
+# Confirmed via: lsusb → "ID ffff:ffff BLIOT CDC Virtual ComPort"
+# Since ffff:ffff is not globally unique, we use diff-based port detection
+# as the primary method and VID:PID as a secondary check.
+PINECIL_V2_VID="ffff"
+PINECIL_V2_PID="ffff"
+
+# Pinecil V1 uses GD32 chip in DFU mode
+PINECIL_V1_VID="28e9"
+PINECIL_V1_PID="0189"
+
+ARG_DEVICE=""
+ARG_LANG=""
+ARG_AUTO=0
+
+# ============================================================
+# TRAPS: separated responsibilities
+# ============================================================
+cleanup() {
+    rm -rf "$TMPDIR_FLASH"
+    flock -u 9 2>/dev/null || true
+}
+on_error() {
+    echo -e "\n${RED}[✗] Script failed at line $1.${NC}" | tee -a "$LOG_FILE"
+    echo -e "${YELLOW}[!] See log for details: $LOG_FILE${NC}"
+}
+
+trap 'cleanup'          EXIT
+trap 'on_error $LINENO' ERR
+
+# ============================================================
+# LOGGING: all stdout/stderr mirrored to log file
+# ============================================================
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+log_header() {
+    {
+        echo "================================================"
+        echo " Pinecil Flash Log — $(date)"
+        echo " Args: $*"
+        echo " User: ${USER:-unknown}  Host: $(hostname)"
+        echo "================================================"
+    } >> "$LOG_FILE"
+}
+
+info()  { echo -e "${GREEN}[✓]${NC} $1"; }
+warn()  { echo -e "${YELLOW}[!]${NC} $1"; }
+error() { echo -e "${RED}[✗]${NC} $1"; exit 1; }
+step()  { echo -e "\n${CYAN}${BOLD}>>> $1${NC}"; }
+debug() { [[ "${DEBUG:-0}" == "1" ]] && echo -e "${CYAN}[D]${NC} $1" || true; }
+
+print_header() {
+    echo -e "${CYAN}"
+    echo "        _                          "
+    echo "  _ __ (_)_ __   ___ _   _ _ __   "
+    echo " | '_ \| | '_ \ / _ \ | | | '_ \  "
+    echo " | |_) | | | | |  __/ |_| | |_) | "
+    echo " | .__/|_|_| |_|\___|\__,_| .__/  "
+    echo " |_|                       |_|     "
+    echo -e "${NC}"
+    echo -e "${BOLD}         Pinecil Arch Updater${NC}"
+    echo -e "         IronOS: https://github.com/Ralim/IronOS"
+    echo -e "         ${CYAN}Log: $LOG_FILE${NC}"
+    echo ""
+}
+
+print_help() {
+    print_header
+    echo -e "${BOLD}Usage:${NC}"
+    echo "  ./pineup                       # interactive mode"
+    echo "  ./pineup --v2 --lang EN        # Pinecil V2, English"
+    echo "  ./pineup --v1 --lang RU        # Pinecil V1, Russian"
+    echo "  ./pineup --v2 --lang EN --auto # fully automated"
+    echo "  DEBUG=1 ./pineup               # verbose debug output"
+    echo ""
+    echo -e "${BOLD}Options:${NC}"
+    echo "  --v1               Pinecil V1 (GD32 chip, pre-2022)"
+    echo "  --v2               Pinecil V2 (BL706 chip, post-2022)"
+    echo "  --device v1|v2     Same as --v1 / --v2"
+    echo "  --lang CODE        Firmware language code"
+    echo "  --auto             Skip all prompts (requires device and --lang)"
+    echo "  --debug     Enable verbose tracing (same as DEBUG=1)"
+    echo "  --help      Show this help"
+    echo ""
+    echo -e "${BOLD}Available language codes:${NC}"
+    echo "  BE BG CS DA DE EL EN ES ET FI FR HR HU IT JA_JP"
+    echo "  LT NB NL NL_BE PL PT RO RU SK SL SR_CYRL SR_LATN"
+    echo "  SV TR UK UZ VI YUE_HK ZH_CN ZH_TW"
+    echo ""
+    exit 0
+}
+
+# ============================================================
+# 0. LOCK — prevent concurrent execution
+# ============================================================
+acquire_lock() {
+    exec 9>"$LOCK_FILE"
+    if ! flock -n 9; then
+        echo -e "${RED}[✗]${NC} Another instance is already running (lock: $LOCK_FILE)."
+        exit 1
+    fi
+    debug "Lock acquired: $LOCK_FILE"
+}
+
+# ============================================================
+# 1. ARGUMENT PARSING
+# ============================================================
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --v1)           ARG_DEVICE="v1" ;;
+            --v2)           ARG_DEVICE="v2" ;;
+            --device)       ARG_DEVICE="${2,,}"; shift ;;
+            --device=*)     ARG_DEVICE="${1#--device=}"; ARG_DEVICE="${ARG_DEVICE,,}" ;;
+            --lang)         ARG_LANG="${2^^}"; shift ;;
+            --lang=*)       ARG_LANG="${1#--lang=}"; ARG_LANG="${ARG_LANG^^}" ;;
+            --auto)         ARG_AUTO=1 ;;
+            --debug)        export DEBUG=1; set -x ;;
+            --help|-h)      print_help ;;
+            *)              error "Unknown argument: $1. Use --help for usage." ;;
+        esac
+        shift
+    done
+
+    if [[ $ARG_AUTO -eq 1 ]]; then
+        [[ -z "$ARG_DEVICE" ]] && error "--auto requires --v1 or --v2"
+        [[ -z "$ARG_LANG"   ]] && error "--auto requires --lang CODE"
+        info "Auto mode enabled: ${ARG_DEVICE^^}, language ${ARG_LANG}"
+    fi
+}
+
+# ============================================================
+# 2. SUDO CHECK
+# ============================================================
+check_sudo() {
+    step "Checking sudo access"
+    if ! sudo -v 2>/dev/null; then
+        error "No sudo access. Add your user to the wheel group."
+    fi
+    info "Sudo access confirmed"
+}
+
+# ============================================================
+# 3. NETWORK CHECK — fail fast before any downloads
+# ============================================================
+check_network() {
+    step "Checking internet connection"
+    if ! curl -fsSI --max-time 5 "https://github.com" &>/dev/null; then
+        error "Cannot reach github.com. Check your internet connection."
+    fi
+    info "Internet connection OK"
+}
+
+# ============================================================
+# 4. PACKAGE MANAGER DETECTION
+# ============================================================
+detect_pkg_manager() {
+    if ! command -v pacman &>/dev/null; then
+        error "Only Arch Linux and derivatives (pacman) are supported."
+    fi
+    AUR_HELPER=""
+    for aur in yay paru; do
+        command -v "$aur" &>/dev/null && AUR_HELPER="$aur" && break
+    done
+    info "Package manager: pacman${AUR_HELPER:+, AUR helper: $AUR_HELPER}"
+}
+
+# ============================================================
+# 5. DEPENDENCY INSTALLATION
+# ============================================================
+install_deps() {
+    step "Checking and installing dependencies"
+
+    local PACMAN_PKGS=() AUR_PKGS=()
+    command -v curl     &>/dev/null || PACMAN_PKGS+=("curl")
+    command -v jq       &>/dev/null || PACMAN_PKGS+=("jq")
+    command -v unzip    &>/dev/null || PACMAN_PKGS+=("unzip")
+    command -v dfu-util &>/dev/null || PACMAN_PKGS+=("dfu-util")
+    command -v blisp    &>/dev/null || AUR_PKGS+=("blisp")
+
+    if [ ${#PACMAN_PKGS[@]} -gt 0 ]; then
+        warn "Installing packages: ${PACMAN_PKGS[*]}"
+        sudo pacman -S --noconfirm --needed "${PACMAN_PKGS[@]}"
+    fi
+
+    if [ ${#AUR_PKGS[@]} -gt 0 ]; then
+        if [ -z "$AUR_HELPER" ]; then
+            warn "No AUR helper found. Installing yay..."
+            sudo pacman -S --noconfirm --needed git base-devel
+            git clone https://aur.archlinux.org/yay.git "$TMPDIR_FLASH/yay"
+            (cd "$TMPDIR_FLASH/yay" && makepkg -si --noconfirm)
+            AUR_HELPER="yay"
+        fi
+        warn "Installing from AUR: ${AUR_PKGS[*]}"
+        "$AUR_HELPER" -S --noconfirm --needed "${AUR_PKGS[@]}"
+    fi
+
+    # Explicit post-install verification
+    for cmd in curl jq unzip blisp dfu-util; do
+        command -v "$cmd" &>/dev/null || error "Failed to install '$cmd'. Try manually."
+    done
+    info "All dependencies installed"
+}
+
+# ============================================================
+# 6. UDEV RULES SETUP
+# ============================================================
+setup_udev() {
+    step "Configuring udev rules"
+
+    local RULES_FILE="/etc/udev/rules.d/99-pinecil.rules"
+    local USER_GROUP
+
+    # Pick the appropriate serial group for this distro
+    if   getent group uucp    &>/dev/null; then USER_GROUP="uucp"
+    elif getent group dialout &>/dev/null; then USER_GROUP="dialout"
+    else sudo groupadd uucp;                    USER_GROUP="uucp"
+    fi
+
+    sudo tee "$RULES_FILE" > /dev/null <<EOF
+# Pinecil V2 — BL706 bootloader (ffff:ffff is the real VID:PID in flash mode)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="$PINECIL_V2_VID", ATTRS{idProduct}=="$PINECIL_V2_PID", MODE="0660", GROUP="$USER_GROUP", TAG+="uaccess"
+SUBSYSTEM=="usb",  ATTRS{idVendor}=="$PINECIL_V2_VID", ATTRS{idProduct}=="$PINECIL_V2_PID", MODE="0660", GROUP="$USER_GROUP", TAG+="uaccess"
+# Pinecil V1 — GD32 in DFU mode
+SUBSYSTEM=="usb",  ATTRS{idVendor}=="$PINECIL_V1_VID", ATTRS{idProduct}=="$PINECIL_V1_PID", MODE="0660", GROUP="$USER_GROUP", TAG+="uaccess"
+EOF
+
+    if ! groups "$USER" | grep -qw "$USER_GROUP"; then
+        sudo usermod -aG "$USER_GROUP" "$USER"
+        warn "User added to group '$USER_GROUP'. TAG=uaccess allows access without re-login."
+    fi
+
+    sudo udevadm control --reload-rules
+    sudo udevadm trigger
+    info "udev rules configured (group: $USER_GROUP)"
+}
+
+# ============================================================
+# 7. DEVICE SELECTION
+# ============================================================
+select_device() {
+    if [ -n "$ARG_DEVICE" ]; then
+        DEVICE="$ARG_DEVICE"
+        info "Device: Pinecil ${DEVICE^^}"
+        return
+    fi
+    step "Select device"
+    echo ""
+    echo -e "  ${BOLD}1)${NC} Pinecil V1  ${CYAN}(GD32 chip, pre-2022)${NC}"
+    echo -e "  ${BOLD}2)${NC} Pinecil V2  ${CYAN}(BL706 chip, post-2022)${NC}"
+    echo ""
+    while true; do
+        read -rp "$(echo -e "${BOLD}Choose device [1/2]: ${NC}")" choice
+        case "$choice" in
+            1) DEVICE="v1"; info "Selected: Pinecil V1"; break ;;
+            2) DEVICE="v2"; info "Selected: Pinecil V2"; break ;;
+            *) warn "Please enter 1 or 2" ;;
+        esac
+    done
+}
+
+# ============================================================
+# 8. LANGUAGE SELECTION
+# ============================================================
+select_language() {
+    declare -gA LANGUAGES=(
+        ["BE"]="Belarusian"   ["BG"]="Bulgarian"     ["CS"]="Czech"
+        ["DA"]="Danish"       ["DE"]="German"         ["EL"]="Greek"
+        ["EN"]="English"      ["ES"]="Spanish"        ["ET"]="Estonian"
+        ["FI"]="Finnish"      ["FR"]="French"         ["HR"]="Croatian"
+        ["HU"]="Hungarian"    ["IT"]="Italian"        ["JA_JP"]="Japanese"
+        ["LT"]="Lithuanian"   ["NB"]="Norwegian"      ["NL"]="Dutch"
+        ["NL_BE"]="Flemish"   ["PL"]="Polish"         ["PT"]="Portuguese"
+        ["RO"]="Romanian"     ["RU"]="Russian"        ["SK"]="Slovak"
+        ["SL"]="Slovenian"    ["SR_CYRL"]="Serbian (Cyrillic)" ["SR_LATN"]="Serbian (Latin)"
+        ["SV"]="Swedish"      ["TR"]="Turkish"        ["UK"]="Ukrainian"
+        ["UZ"]="Uzbek"        ["VI"]="Vietnamese"     ["YUE_HK"]="Cantonese"
+        ["ZH_CN"]="Chinese (Simplified)" ["ZH_TW"]="Chinese (Traditional)"
+    )
+
+    if [ -n "$ARG_LANG" ]; then
+        [[ -n "${LANGUAGES[$ARG_LANG]+_}" ]] || error "Unknown language code: '$ARG_LANG'. Use --help."
+        LANGUAGE="$ARG_LANG"
+        info "Language: ${LANGUAGES[$LANGUAGE]} ($LANGUAGE)"
+        return
+    fi
+
+    step "Select firmware language"
+    echo ""
+    local col=0
+    mapfile -t sorted_keys < <(printf '%s\n' "${!LANGUAGES[@]}" | sort)
+    for key in "${sorted_keys[@]}"; do
+        printf "  ${BOLD}%-10s${NC}%-28s" "$key" "${LANGUAGES[$key]}"
+        col=$(( col + 1 )); (( col % 3 == 0 )) && echo "" || true
+    done
+    echo -e "\n"
+
+    while true; do
+        read -rp "$(echo -e "${BOLD}Enter language code (e.g. EN): ${NC}")" LANG_INPUT
+        LANG_INPUT="${LANG_INPUT^^}"
+        if [[ -n "${LANGUAGES[$LANG_INPUT]+_}" ]]; then
+            LANGUAGE="$LANG_INPUT"
+            info "Selected: ${LANGUAGES[$LANGUAGE]} ($LANGUAGE)"
+            break
+        else
+            warn "Unknown code. Try again."
+        fi
+    done
+}
+
+# ============================================================
+# 9. FIRMWARE DOWNLOAD
+# ============================================================
+download_firmware() {
+    step "Downloading latest IronOS firmware"
+
+    local API_URL="https://api.github.com/repos/Ralim/IronOS/releases/latest"
+    local RELEASE_JSON="" attempts=0
+
+    # Retry up to 3 times in case of transient GitHub API errors
+    while [ $attempts -lt 3 ]; do
+        RELEASE_JSON=$(curl -sf --max-time 15 "$API_URL" 2>/dev/null) && break
+        attempts=$(( attempts + 1 ))
+        warn "GitHub API request failed (attempt $attempts/3)..."
+        sleep 3
+    done
+    [ -z "$RELEASE_JSON" ] && error "Failed to fetch release info from GitHub."
+
+    FIRMWARE_VERSION=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+    info "Latest version: ${BOLD}$FIRMWARE_VERSION${NC}"
+
+    local ZIP_NAME DEVICE_DIR
+    if [ "$DEVICE" = "v2" ]; then
+        ZIP_NAME="Pinecilv2.zip"; DEVICE_DIR="Pinecilv2"
+    else
+        ZIP_NAME="Pinecil.zip";   DEVICE_DIR="Pinecil"
+    fi
+
+    local DOWNLOAD_URL
+    DOWNLOAD_URL=$(echo "$RELEASE_JSON" | jq -r ".assets[] | select(.name == \"$ZIP_NAME\") | .browser_download_url")
+    [ -z "$DOWNLOAD_URL" ] && error "Asset $ZIP_NAME not found in release $FIRMWARE_VERSION"
+
+    info "Downloading $ZIP_NAME..."
+    # --retry covers slow/unstable connections
+    curl -L --progress-bar --max-time 120 --retry 3 --retry-delay 2 \
+        -o "$TMPDIR_FLASH/$ZIP_NAME" "$DOWNLOAD_URL"
+
+    unzip -q "$TMPDIR_FLASH/$ZIP_NAME" -d "$TMPDIR_FLASH/"
+
+    # Search inside the device-specific subfolder first, then fall back to anywhere
+    local BIN_CANDIDATES=()
+    mapfile -t BIN_CANDIDATES < <(find "$TMPDIR_FLASH" -path "*/$DEVICE_DIR/*" -name "*_${LANGUAGE}.bin" 2>/dev/null || true)
+    if [ ${#BIN_CANDIDATES[@]} -eq 0 ]; then
+        mapfile -t BIN_CANDIDATES < <(find "$TMPDIR_FLASH" -name "*_${LANGUAGE}.bin" 2>/dev/null || true)
+    fi
+
+    [ ${#BIN_CANDIDATES[@]} -eq 0 ] && error "No firmware binary found for language '$LANGUAGE'."
+    [ ${#BIN_CANDIDATES[@]} -gt 1 ] && warn "Multiple .bin files found, using: ${BIN_CANDIDATES[0]}"
+
+    BIN_FILE="${BIN_CANDIDATES[0]}"
+    info "Firmware file: $(basename "$BIN_FILE")"
+}
+
+# ============================================================
+# 10. DEVICE PORT DETECTION — 3-method cascade
+# ============================================================
+
+# Use ls directly (no intermediate variable) to avoid issues
+# with whitespace or newlines in device names
+snapshot_tty_devices() {
+    ls /dev/ttyACM* /dev/ttyUSB* 2>/dev/null | sort || true
+}
+
+# Method 1: precise VID:PID match via udevadm
+find_device_by_vid_pid() {
+    local vid="$1" pid="$2"
+    for dev in /dev/ttyACM* /dev/ttyUSB*; do
+        [ -e "$dev" ] || continue
+        local dev_vid dev_pid
+        dev_vid=$(udevadm info --query=property --name="$dev" 2>/dev/null | grep "^ID_VENDOR_ID=" | cut -d= -f2 || true)
+        dev_pid=$(udevadm info --query=property --name="$dev" 2>/dev/null | grep "^ID_MODEL_ID="  | cut -d= -f2 || true)
+        debug "  $dev → VID=$dev_vid PID=$dev_pid"
+        if [[ "${dev_vid,,}" == "${vid,,}" && "${dev_pid,,}" == "${pid,,}" ]]; then
+            echo "$dev"; return 0
+        fi
+    done
+    return 1
+}
+
+wait_for_device() {
+    step "Connect Pinecil in flash mode"
+    echo ""
+
+    if [ "$DEVICE" = "v2" ]; then
+        echo -e "  ${YELLOW}Pinecil V2:${NC}"
+        echo -e "  1. ${BOLD}Unplug${NC} Pinecil from USB"
+        echo -e "  2. Hold the ${BOLD}[ − ]${NC} (minus) button"
+        echo -e "  3. While holding — plug in USB"
+        echo -e "  4. The screen should remain ${BOLD}blank${NC}"
+    else
+        echo -e "  ${YELLOW}Pinecil V1:${NC}"
+        echo -e "  1. ${BOLD}Unplug${NC} Pinecil from USB"
+        echo -e "  2. Hold the ${BOLD}[ − ]${NC} (minus) button"
+        echo -e "  3. Plug in USB"
+    fi
+    echo ""
+
+    # Snapshot BEFORE connecting — used for diff-based detection
+    local BEFORE
+    BEFORE=$(snapshot_tty_devices)
+    debug "Ports before connect: $(echo "$BEFORE" | tr '\n' ' ')"
+
+    if [[ $ARG_AUTO -eq 0 ]]; then
+        read -rp "$(echo -e "${BOLD}Press Enter once the device is connected...${NC}")"
+    else
+        warn "Auto mode: waiting for device (up to 30s)..."
+        sleep 2
+    fi
+
+    local attempts=0
+    DEVICE_PORT=""
+
+    while [ $attempts -lt 15 ]; do
+        if [ "$DEVICE" = "v2" ]; then
+
+            # Method 1: exact VID:PID match via udevadm
+            DEVICE_PORT=$(find_device_by_vid_pid "$PINECIL_V2_VID" "$PINECIL_V2_PID" || true)
+
+            # Method 2: diff-based detection — only NEW ports since BEFORE snapshot
+            # Snapshot is taken fresh here to avoid race conditions
+            if [ -z "$DEVICE_PORT" ]; then
+                local AFTER NEW_PORTS
+                AFTER=$(snapshot_tty_devices)
+                debug "Ports after connect: $(echo "$AFTER" | tr '\n' ' ')"
+                NEW_PORTS=$(comm -13 <(echo "$BEFORE") <(echo "$AFTER") || true)
+                debug "New ports (diff): $(echo "$NEW_PORTS" | tr '\n' ' ')"
+                if [ -n "$NEW_PORTS" ]; then
+                    # Prefer ttyACM, fall back to any new port
+                    DEVICE_PORT=$(echo "$NEW_PORTS" | grep "ttyACM" | head -1 || \
+                                  echo "$NEW_PORTS" | head -1 || true)
+                    [ -n "$DEVICE_PORT" ] && warn "Port found via diff: $DEVICE_PORT"
+                fi
+            fi
+
+            # Method 3: last resort — lsusb confirms device, diff picks the port
+            if [ -z "$DEVICE_PORT" ] && lsusb | grep -qi "${PINECIL_V2_VID}:${PINECIL_V2_PID}"; then
+                local AFTER2 NEW_ACM
+                AFTER2=$(snapshot_tty_devices)
+                NEW_ACM=$(comm -13 <(echo "$BEFORE") <(echo "$AFTER2") \
+                          | grep "ttyACM" | head -1 || true)
+                if [ -n "$NEW_ACM" ]; then
+                    DEVICE_PORT="$NEW_ACM"
+                    warn "Fallback (lsusb + diff): $DEVICE_PORT"
+                fi
+            fi
+
+        else
+            # V1: DFU mode detected via dfu-util
+            dfu-util -l 2>/dev/null | grep -qi "${PINECIL_V1_VID}:${PINECIL_V1_PID}" \
+                && DEVICE_PORT="dfu"
+        fi
+
+        [ -n "$DEVICE_PORT" ] && break
+        warn "Device not found (attempt $((attempts+1))/15)..."
+        sleep 2
+        attempts=$(( attempts + 1 ))
+    done
+
+    [ -z "$DEVICE_PORT" ] && error "Device not found. Check your cable and flash mode."
+    info "Device: $DEVICE_PORT"
+}
+
+# ============================================================
+# 11. FLASH + RESULT VERIFICATION
+# ============================================================
+flash_device() {
+    step "Flashing firmware"
+    echo ""
+    warn "DO NOT unplug Pinecil during flashing!"
+    echo ""
+
+    local BLISP_LOG="$TMPDIR_FLASH/blisp.log"
+    local FLASH_OK=0
+
+    if [ "$DEVICE" = "v2" ]; then
+        # Capture blisp output for post-flash verification
+        if blisp write -c bl70x -p "$DEVICE_PORT" --reset "$BIN_FILE" \
+            | tee "$BLISP_LOG"; then
+            if grep -qi "flash complete\|program ok\|success" "$BLISP_LOG"; then
+                FLASH_OK=1
+            else
+                # Trust the exit code but warn that no success string was found
+                warn "blisp exited cleanly but no success confirmation found in output."
+                warn "Check the log if you experience issues: $LOG_FILE"
+                FLASH_OK=1
+            fi
+        fi
+    else
+        if dfu-util -D "$BIN_FILE" --alt 0 -s 0x08000000:leave; then
+            FLASH_OK=1
+        fi
+    fi
+
+    [ $FLASH_OK -eq 0 ] && error "Flashing failed. See log: $LOG_FILE"
+
+    # Post-flash check: device should disappear from flash mode after reset
+    info "Verifying device reboot..."
+    sleep 3
+    if [ "$DEVICE" = "v2" ]; then
+        if lsusb | grep -qi "${PINECIL_V2_VID}:${PINECIL_V2_PID}"; then
+            warn "Device still appears in flash mode — reset may have failed."
+            warn "Try unplugging and reconnecting Pinecil manually."
+        else
+            info "Device exited flash mode successfully."
+        fi
+    fi
+
+    echo ""
+    echo -e "${GREEN}${BOLD}"
+    echo "  ╔══════════════════════════════════════╗"
+    echo "  ║           Flash complete!            ║"
+    echo "  ╚══════════════════════════════════════╝"
+    echo -e "${NC}"
+    info "Version:  ${BOLD}$FIRMWARE_VERSION${NC}"
+    info "Language: ${BOLD}$LANGUAGE${NC}"
+    info "Log:      ${BOLD}$LOG_FILE${NC}"
+}
+
+# ============================================================
+# MAIN
+# ============================================================
+main() {
+    parse_args "$@"
+    acquire_lock
+    log_header "$@"
+    print_header
+    check_sudo
+    check_network
+    detect_pkg_manager
+    install_deps
+    setup_udev
+    select_device
+    select_language
+    download_firmware
+    wait_for_device
+    flash_device
+}
+
+main "$@"
